@@ -415,6 +415,55 @@ def buy_and_hold_strat(px, tcost_bps = 20):
     plt.tight_layout()
     plt.show()
     return portfolio_val
+
+# ----------------------------------------------------------------------------------- #
+
+def combine_strats(px: pd.DataFrame, lookback, percentile, fast, slow, signal_val, tcost_bps = 20):
+    ret = px.pct_change(fill_method = None)
+    
+    momentum_port = ret.ewm(span = lookback, adjust = False).mean()
+    ranks = momentum_port.rank(axis = 1, pct = True)
+    quantile = percentile / 10.0
+    long = (ranks >= 1 - quantile).astype(float)
+    short = (ranks <= quantile).astype(float)
+    momentum_port = (long - short)
+    momentum_port = momentum_port.div(momentum_port.abs().sum(axis = 1), axis = 0)
+    
+    
+    macd = pd.DataFrame(index=px.index, columns=px.columns)
+    signal_line = pd.DataFrame(index=px.index, columns=px.columns)
+    signal = pd.DataFrame(index=px.index, columns=px.columns)  
+    for asset in px.columns:
+        price = px[asset]
+    
+        ema_fast = price.ewm(span=fast, adjust=False).mean()
+        ema_slow = price.ewm(span=slow, adjust=False).mean()
+        macd_line = ema_fast - ema_slow
+        sig_line = macd_line.ewm(span=signal_val, adjust=False).mean()
+    
+        macd[asset] = macd_line
+        signal_line[asset] = sig_line
+        signal[asset] = np.sign(macd_line - sig_line)
+    
+    macd_port = signal.div(signal.abs().sum(axis = 1), axis = 0)
+    
+    
+    full_port = 2.0 / 3 * momentum_port + 1.0 / 3 * macd_port
+    
+    turnover = full_port.diff().abs()
+    gross_ret = full_port.shift() * ret
+    net_ret = gross_ret - turnover * tcost_bps * 1e-4
+    
+    total_net_ret = net_ret.sum(axis = 1)
+    
+    sharpe = total_net_ret.mean() / total_net_ret.std() * np.sqrt(365)
+    
+    results = {
+        'sharpe': sharpe,
+        'net_ret': net_ret
+    }
+    
+    return results    
     
 # ----------------------------------------------------------------------------------- #
 
@@ -474,10 +523,16 @@ def main():
     best_momentum_test, _ = train_momentum_strat(test_px[cols], test_vol[cols], lookbacks = [best_momentum_strat['lookback']], lags = [best_momentum_strat['lag']], percentiles=[10 * best_momentum_strat['quantile']], tcost_bps= 20)
     best_momentum_full, _ = train_momentum_strat(px[cols], vol[cols], lookbacks= [best_momentum_strat['lookback']], lags = [best_momentum_strat['lag']], percentiles=[10 * best_momentum_strat['quantile']], tcost_bps = 20)
     
-    best_macd_strat, _ = macd_strat(train_px[cols], fast_lookback=range(20, 51, 5), slow_lookback=range(100, 181, 5), signal_period=range(5, 40, 5), tcost_bps=20)
+    best_macd_strat, _ = macd_strat(train_px[cols], fast_lookback=range(25, 36, 5), slow_lookback=range(155, 166, 5), signal_period=range(10, 21, 5), tcost_bps=20)
     best_macd_test, _ = macd_strat(test_px[cols], fast_lookback=[best_macd_strat['fast']], slow_lookback=[best_macd_strat['slow']], signal_period=[best_macd_strat['signal']], tcost_bps = 20)
     best_macd_full, _ = macd_strat(px[cols], fast_lookback=[best_macd_strat['fast']], slow_lookback=[best_macd_strat['slow']], signal_period=[best_macd_strat['signal']], tcost_bps = 20)
-
+    
+    combined_strats = combine_strats(px, best_momentum_strat['lookback'], 10 * best_momentum_strat['quantile'], best_macd_strat['fast'], best_macd_strat['slow'], best_macd_strat['signal'])
+    
+    plt.figure(figsize = (12, 6))
+    plt.plot((1 + combined_strats['net_ret'].sum(axis = 1)).cumprod())
+    plt.title(f"Combined strats with sharpe {combined_strats['sharpe']}")
+    plt.show()
     
     momentum_ret = best_momentum_full['net_ret'].sum(axis = 1)
     macd_ret = best_macd_full['returns'].sum(axis = 1)
@@ -498,25 +553,44 @@ def main():
     data = data.dropna()
     macd_ret = data['macd']
     bench_ret2 = data['bench']
+    
+    combined_ret = combined_strats['net_ret'].sum(axis = 1)
+    bench_ret3 = bench_ret
+    combined_ret, bench_ret3 = combined_ret.align(bench_ret3, join='inner')
+    data = pd.concat([combined_ret, bench_ret3], axis = 1)
+    data.columns = ['combined', 'bench']
+    data = data.dropna()
+    combined_ret = data['combined']
+    bench_ret3 = data['bench']
 
     x = sm.add_constant(bench_ret)
     model_momentum = sm.OLS(momentum_ret, x).fit()
     alpha_momentum = model_momentum.params['const']
     beta_momentum = model_momentum.params['bench']
+    t_stat_momentum = model_momentum.tvalues['const']
     
     x2 = sm.add_constant(bench_ret2)
     model_macd = sm.OLS(macd_ret, x2).fit()
     alpha_macd = model_macd.params['const']
+    t_stat_macd = model_macd.tvalues['const']
     beta_macd = model_macd.params['bench']
+    
+    x3 = sm.add_constant(bench_ret3)
+    model_combined = sm.OLS(combined_ret, x3).fit()
+    alpha_combined = model_combined.params['const']
+    t_stat_combined = model_combined.tvalues['const']
+    beta_combined = model_combined.params['bench']
     
     momentum_resid = model_momentum.resid
     macd_resid = model_macd.resid
+    combined_resid = model_combined.resid
     
     print("MOMENTUM STRAT\n----------------------------------------------")
     print(f"PRIOR CORRELATION: {momentum_ret.corr(bench_ret)}")
     print(f"POST DISTILLATION CORRELATION: {momentum_resid.corr(bench_ret)}")
     print(f"Beta: {beta_momentum}")
     print(f"Alpha: {alpha_momentum}")
+    print(f"Alpha T-Statistic: {t_stat_momentum}")
     print(f"Original Volatility: {momentum_ret.std() * np.sqrt(365)}")
     print(f"Residual Volatility: {momentum_resid.std() * np.sqrt(365)}")
     print(f"Original Sharpe: {momentum_ret.mean() / momentum_ret.std() * np.sqrt(365)}")
@@ -528,11 +602,26 @@ def main():
     print(f"POST DISTILLATION CORRELATION: {macd_resid.corr(bench_ret2)}")
     print(f"Beta: {beta_macd}")
     print(f"Alpha: {alpha_macd}")
+    print(f"Alpha T-Statistic: {t_stat_macd}")
     print(f"Original Volatility: {macd_ret.std() * np.sqrt(365)}")
     print(f"Residual Volatility: {macd_resid.std() * np.sqrt(365)}")
     print(f"Original Sharpe: {macd_ret.mean() / macd_ret.std() * np.sqrt(365)}")
     print(f"Residual Sharpe: {(macd_resid.mean() + alpha_macd) / macd_resid.std() * np.sqrt(365)}")
     print("----------------------------------------------")
+    
+    print("COMBINED STRAT\n----------------------------------------------")
+    print(f"PRIOR CORRELATION: {combined_ret.corr(bench_ret3)}")
+    print(f"POST DISTILLATION CORRELATION: {combined_resid.corr(bench_ret3)}")
+    print(f"Beta: {beta_combined}")
+    print(f"Alpha: {alpha_combined}")
+    print(f"Alpha T-Statistic: {t_stat_combined}")
+    print(f"Original Volatility: {combined_ret.std() * np.sqrt(365)}")
+    print(f"Residual Volatility: {combined_resid.std() * np.sqrt(365)}")
+    print(f"Original Sharpe: {combined_ret.mean() / combined_ret.std() * np.sqrt(365)}")
+    print(f"Residual Sharpe: {(combined_resid.mean() + alpha_combined) / combined_resid.std() * np.sqrt(365)}")
+    print("----------------------------------------------")
+    
+    print(f"Correlation between the two strategies: {macd_ret.corr(momentum_ret)}")
     
     momentum_alpha_contr = momentum_resid + alpha_momentum
     
@@ -561,6 +650,22 @@ def main():
     plt.grid(True)
     plt.tight_layout()
     plt.show()
+    
+    combined_alpha_contr = combined_resid + alpha_combined
+    
+    plt.figure(figsize=(12, 6))
+    plt.plot((1 + combined_ret).cumprod().index, (1 + combined_ret).cumprod().values, label="Strategy", alpha = 0.7)
+    plt.plot((1 + combined_alpha_contr).cumprod().index, (1 + combined_alpha_contr).cumprod().values, label=f"Alpha", alpha = 0.7)
+    plt.plot((1 + bench_ret3).cumprod().index, (1 + bench_ret3 * beta_combined).cumprod().values, label="Buy and Hold", alpha = 0.7)
+    plt.title("Strategy, Alpha, and Benchmark")
+    plt.xlabel("Date")
+    plt.ylabel("Cumulative Net Return")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+    
+    
     
 # ----------------------------------------------------------------------------------- #
 
