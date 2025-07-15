@@ -295,7 +295,7 @@ def macd_strat(train_px: pd.DataFrame, fast_lookback, slow_lookback, signal_peri
     train_ret = train_px.pct_change(fill_method=None)
     
     print("=" * 60)
-    print("MACD STRATEGY - TRAINING PHASE")
+    print("MACD STRATEGY")
     print("=" * 60)
     
     # Training phase - find best configuration
@@ -324,6 +324,23 @@ def macd_strat(train_px: pd.DataFrame, fast_lookback, slow_lookback, signal_peri
         turnover = weights.diff().abs()
         gross_ret = (weights.shift() * train_ret)
         net_ret = gross_ret - turnover * tcost_bps * 1e-4
+        vols = {}
+        for asset in net_ret.columns:
+            vols[asset] = net_ret[asset].std(skipna=True)
+        vols = pd.DataFrame([vols]).fillna(0)
+        sum_vols = vols.sum(axis = 1)
+        for asset in vols.columns:
+            if vols[asset].iloc[0] == 0:
+                continue
+            vols[asset] = sum_vols / vols[asset]
+        vols = vols.div(vols.sum(axis = 1), axis = 0)
+        
+        weights = signal.div(signal.abs().sum(axis = 1), axis = 0)
+        weights = weights * vols.iloc[0]
+        turnover = weights.diff().abs()
+        gross_ret = (weights.shift() * train_ret)
+        net_ret = gross_ret - turnover * tcost_bps * 1e-4
+        
         cum_net = (1 + net_ret).cumprod()
         
         total_net_ret = net_ret.sum(axis = 1)
@@ -336,7 +353,8 @@ def macd_strat(train_px: pd.DataFrame, fast_lookback, slow_lookback, signal_peri
             'signal': sp,
             'sharpe': strat_sharpe,
             'cum_net': cum_net.iloc[-1],
-            'returns': net_ret
+            'returns': net_ret,
+            'weights': vols.iloc[0]
         })
             
     train_results_df = pd.DataFrame(train_results).sort_values(by='sharpe', ascending=False)
@@ -350,12 +368,12 @@ def macd_strat(train_px: pd.DataFrame, fast_lookback, slow_lookback, signal_peri
     best_signal = best_config['signal']
     
     print(f"\nBest Configuration: Fast={best_fast}, Slow={best_slow}, Signal={best_signal}")
-    print(f"Training Sharpe: {best_config['sharpe']:.3f}")
+    print(f"Sharpe: {best_config['sharpe']:.3f}")
     
     # Plot training results
     pivot = train_results_df.pivot_table(index='fast', columns='slow', values='sharpe')
     plt.figure(figsize=(12, 6))
-    plt.title("Training Sharpe Ratio (Signal Period Fixed)")
+    plt.title("Sharpe Ratio (Signal Period Fixed)")
     plt.xlabel("Slow EMA")
     plt.ylabel("Fast EMA")
     plt.imshow(pivot, cmap='viridis', origin='lower', aspect='auto')
@@ -377,9 +395,8 @@ def macd_strat(train_px: pd.DataFrame, fast_lookback, slow_lookback, signal_peri
         asset_cum_ret = (1 + best_train_returns[column]).cumprod()
         plt.plot(asset_cum_ret.index, asset_cum_ret.values, label=f"{column} (Individual)", alpha=0.5)
     
-    print(f"Portfolio cumulative return: {cum_ret_train.iloc[-1] - 1:.3f}")
     plt.plot(cum_ret_train.index, cum_ret_train.values, label='Portfolio (Best MACD Strategy)', color='blue', linewidth=2)
-    plt.title(f"Training Performance — Best MACD Strategy\nFast={best_fast}, Slow={best_slow}, Signal={best_signal}")
+    plt.title(f"Performance — Best MACD Strategy\nFast={best_fast}, Slow={best_slow}, Signal={best_signal}")
     plt.xlabel("Time")
     plt.ylabel("Cumulative Return")
     plt.grid(True)
@@ -418,7 +435,7 @@ def buy_and_hold_strat(px, tcost_bps = 20):
 
 # ----------------------------------------------------------------------------------- #
 
-def combine_strats(px: pd.DataFrame, lookback, percentile, fast, slow, signal_val, tcost_bps = 20):
+def combine_strats(px: pd.DataFrame, lookback, percentile, fast, slow, signal_val, weights, tcost_bps = 20):
     ret = px.pct_change(fill_method = None)
     
     momentum_port = ret.ewm(span = lookback, adjust = False).mean()
@@ -446,9 +463,9 @@ def combine_strats(px: pd.DataFrame, lookback, percentile, fast, slow, signal_va
         signal[asset] = np.sign(macd_line - sig_line)
     
     macd_port = signal.div(signal.abs().sum(axis = 1), axis = 0)
+    macd_port = macd_port * weights
     
-    
-    full_port = 2.0 / 3 * momentum_port + 1.0 / 3 * macd_port
+    full_port = 1.0 / 5.2 * momentum_port + 4.2 / 5.2 * macd_port
     
     turnover = full_port.diff().abs()
     gross_ret = full_port.shift() * ret
@@ -527,7 +544,7 @@ def main():
     best_macd_test, _ = macd_strat(test_px[cols], fast_lookback=[best_macd_strat['fast']], slow_lookback=[best_macd_strat['slow']], signal_period=[best_macd_strat['signal']], tcost_bps = 20)
     best_macd_full, _ = macd_strat(px[cols], fast_lookback=[best_macd_strat['fast']], slow_lookback=[best_macd_strat['slow']], signal_period=[best_macd_strat['signal']], tcost_bps = 20)
     
-    combined_strats = combine_strats(px, best_momentum_strat['lookback'], 10 * best_momentum_strat['quantile'], best_macd_strat['fast'], best_macd_strat['slow'], best_macd_strat['signal'])
+    combined_strats = combine_strats(px, best_momentum_strat['lookback'], 10 * best_momentum_strat['quantile'], best_macd_strat['fast'], best_macd_strat['slow'], best_macd_strat['signal'], best_macd_strat['weights'])
     
     plt.figure(figsize = (12, 6))
     plt.plot((1 + combined_strats['net_ret'].sum(axis = 1)).cumprod())
@@ -664,8 +681,6 @@ def main():
     plt.grid(True)
     plt.tight_layout()
     plt.show()
-    
-    
     
 # ----------------------------------------------------------------------------------- #
 
